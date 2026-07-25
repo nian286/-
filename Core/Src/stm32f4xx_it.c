@@ -199,5 +199,13 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+// USART1 全局中断：IDLE 中断靠它进 ISR
+void USART1_IRQHandler(void) {
+    HAL_UART_IRQHandler(&huart1);
+}
 
+// DMA2 Stream2 中断：DMA 收满/半满/错误靠它进 ISR（必须在，否则 DMA 回调不触发）
+void DMA2_Stream2_IRQHandler(void) {
+    HAL_DMA_IRQHandler(&hdma_usart1_rx);
+}
 /* USER CODE END 1 */

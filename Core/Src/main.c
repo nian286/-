@@ -46,8 +46,20 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-#define RX_BUF_SIZE 64
-uint8_t rx_buf[RX_BUF_SIZE];
+DMA_HandleTypeDef hdma_usart1_rx;          // USART1_RX 的 DMA 句柄（手动配置）
+
+#define DMA_BUF_SIZE 64
+uint8_t dma_buf[DMA_BUF_SIZE];             // DMA 搬运目的地（底层缓冲）
+
+// ---- 环形缓冲：解耦“DMA 收(生产者/ISR)”与“main 解析(消费者)” ----
+#define RB_SIZE 128
+typedef struct {
+    uint8_t  buf[RB_SIZE];
+    volatile uint16_t head;                // 写指针（ISR 增长）
+    volatile uint16_t tail;                // 读指针（main 增长）
+    volatile uint32_t overflow;            // 满时丢帧计数
+} ring_buf_t;
+ring_buf_t rb;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -55,7 +67,11 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void MX_DMA_Init(void);
+static void ring_put(uint8_t c);
+static int  ring_get(uint8_t *c);
+static void drain_uart(void);
+static void process_command(uint8_t *cmd, uint16_t len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -95,10 +111,14 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buf, RX_BUF_SIZE);  // 启动 IDLE 中断接收
-  printf("UART RX ready, send 'LED ON' or 'LED OFF'\r\n");
+  // 启动 DMA + IDLE：硬件后台搬字节，仅一帧结束(IDLE)进一次回调，CPU 几乎零打扰
+  if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1, dma_buf, DMA_BUF_SIZE) != HAL_OK) {
+      Error_Handler();
+  }
+  printf("UART DMA RX ready, send 'LED ON' / 'LED OFF'\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -106,10 +126,17 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-    
-    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);  // LED1 心跳：证明程序在跑
-    printf("tick=%lu\r\n", HAL_GetTick());
-    HAL_Delay(1000);
+
+    drain_uart();   // 消费环形缓冲，解析串口命令（消费者）
+
+    // 1s 心跳：LED1 翻转 + 打 tick，证明主循环在跑
+    static uint32_t last_tick = 0;
+    if (HAL_GetTick() - last_tick >= 1000) {
+        last_tick = HAL_GetTick();
+        HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+        printf("tick=%lu\r\n", last_tick);
+    }
+    HAL_Delay(10);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -174,7 +201,9 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE END USART1_Init 0 */
 
   /* USER CODE BEGIN USART1_Init 1 */
-
+  // 使能 USART1 全局中断（IDLE 中断靠它进 ISR；上一版没接导致收不到）
+  HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
@@ -189,7 +218,8 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  // 把 DMA 句柄挂到 UART 的 RX 通道（必须在 HAL_UART_Init 之后）
+  __HAL_LINKDMA(&huart1, hdmarx, hdma_usart1_rx);
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -226,25 +256,90 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UARTEx_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1) {
-        // 实际收到的字节数 = 缓冲总长 - 剩余未收数（IDLE 触发时 RxXferCount 已被更新）
-        uint16_t len = RX_BUF_SIZE - huart->RxXferCount;
+// ---- 环形缓冲基本操作 ----
+static uint16_t ring_count(void) { return (rb.head - rb.tail + RB_SIZE) % RB_SIZE; }
+static uint16_t ring_free(void)  { return RB_SIZE - 1 - ring_count(); }
 
-        if (len >= 6 && strncmp((char *)rx_buf, "LED ON", 6) == 0) {
-            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);  // 低电平点亮
-            HAL_UART_Transmit(&huart1, (uint8_t *)"LED0 ON\r\n", 9, 100);
-        } else if (len >= 7 && strncmp((char *)rx_buf, "LED OFF", 7) == 0) {
-            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);    // 高电平熄灭
-            HAL_UART_Transmit(&huart1, (uint8_t *)"LED0 OFF\r\n", 10, 100);
-        } else {
-            HAL_UART_Transmit(&huart1, (uint8_t *)"Unknown\r\n", 9, 100);
-        }
+static void ring_put(uint8_t c) {
+    if (ring_free() == 0) { rb.overflow++; return; }   // 满：丢新保旧，记溢出
+    rb.buf[rb.head] = c;
+    rb.head = (rb.head + 1) % RB_SIZE;
+}
+static int ring_get(uint8_t *c) {
+    if (ring_count() == 0) return -1;
+    *c = rb.buf[rb.tail];
+    rb.tail = (rb.tail + 1) % RB_SIZE;
+    return 0;
+}
 
-        // 关键：重新武装接收，否则只收一轮就"聋"
-        HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buf, RX_BUF_SIZE);
+// ---- DMA 初始化（手动替代 CubeMX 生成；USART1_RX -> DMA2_Stream2/CH4） ----
+static void MX_DMA_Init(void) {
+    __HAL_RCC_DMA2_CLK_ENABLE();
+    hdma_usart1_rx.Instance                 = DMA2_Stream2;
+    hdma_usart1_rx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart1_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_usart1_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart1_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_rx.Init.Mode                = DMA_NORMAL;   // 收满或 IDLE 停，回调里重武装
+    hdma_usart1_rx.Init.Priority            = DMA_PRIORITY_LOW;
+    hdma_usart1_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart1_rx) != HAL_OK) { Error_Handler(); }
+
+    HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+}
+
+// ---- 命令解析（消费者，main 上下文） ----
+static void process_command(uint8_t *cmd, uint16_t len) {
+    if (len >= 6 && strncmp((char *)cmd, "LED ON", 6) == 0) {
+        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);  // 低电平亮
+        printf("LED0 ON\r\n");
+    } else if (len >= 7 && strncmp((char *)cmd, "LED OFF", 7) == 0) {
+        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);    // 高电平灭
+        printf("LED0 OFF\r\n");
+    } else {
+        printf("Unknown: %s\r\n", cmd);
     }
+}
+
+// ---- 从环形缓冲解析命令（消费者，main 上下文）----
+// 兼容两种发送方式：① 带回车/换行（标准帧结束）② 不带换行，收到完整命令前缀即执行
+static void drain_uart(void) {
+    static uint8_t line[64];
+    static uint16_t li = 0;
+    uint8_t c;
+    while (ring_get(&c) == 0) {
+        if (c == '\r' || c == '\n') {   // 换行：结束本帧（兼容带换行的发送）
+            if (li > 0) {
+                line[li] = 0;
+                process_command(line, li);
+                li = 0;
+            }
+            continue;
+        }
+        if (li < sizeof(line) - 1) line[li++] = c;
+        // 无换行兜底：收到完整命令前缀立即执行，免去“必须发回车”的限制（修复回归）
+        if (li >= 7 && strncmp((char *)line, "LED OFF", 7) == 0) {
+            process_command(line, 7); li = 0;
+        } else if (li >= 6 && strncmp((char *)line, "LED ON", 6) == 0) {
+            process_command(line, 6); li = 0;
+        }
+    }
+}
+
+// ---- 收完一帧（TC 或 IDLE）回调：生产者，ISR 上下文 ----
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart->Instance != USART1) return;
+    // NORMAL 模式下 HT(半传输) 也会进回调但不停收，忽略它，只处理 TC/IDLE
+    if (HAL_UARTEx_GetRxEventType(huart) == HAL_UART_RXEVENT_HT) return;
+
+    for (uint16_t i = 0; i < Size; i++) {
+        ring_put(dma_buf[i]);   // 这一帧新到的字节搬进环形缓冲
+    }
+    // 重武装：继续等下一帧（NORMAL 模式需手动重开）
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, dma_buf, DMA_BUF_SIZE);
 }
 /* USER CODE END 4 */
 
