@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,7 +46,8 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+#define RX_BUF_SIZE 64
+uint8_t rx_buf[RX_BUF_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,7 +97,8 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buf, RX_BUF_SIZE);  // 启动 IDLE 中断接收
+  printf("UART RX ready, send 'LED ON' or 'LED OFF'\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -104,9 +107,8 @@ int main(void)
   {
     /* USER CODE END WHILE */
     
-    HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
-    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-    printf("Hello UART! tick=%lu\r\n", HAL_GetTick());
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);  // LED1 心跳：证明程序在跑
+    printf("tick=%lu\r\n", HAL_GetTick());
     HAL_Delay(1000);
     /* USER CODE BEGIN 3 */
   }
@@ -224,7 +226,26 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UARTEx_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        // 实际收到的字节数 = 缓冲总长 - 剩余未收数（IDLE 触发时 RxXferCount 已被更新）
+        uint16_t len = RX_BUF_SIZE - huart->RxXferCount;
 
+        if (len >= 6 && strncmp((char *)rx_buf, "LED ON", 6) == 0) {
+            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);  // 低电平点亮
+            HAL_UART_Transmit(&huart1, (uint8_t *)"LED0 ON\r\n", 9, 100);
+        } else if (len >= 7 && strncmp((char *)rx_buf, "LED OFF", 7) == 0) {
+            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);    // 高电平熄灭
+            HAL_UART_Transmit(&huart1, (uint8_t *)"LED0 OFF\r\n", 10, 100);
+        } else {
+            HAL_UART_Transmit(&huart1, (uint8_t *)"Unknown\r\n", 9, 100);
+        }
+
+        // 关键：重新武装接收，否则只收一轮就"聋"
+        HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buf, RX_BUF_SIZE);
+    }
+}
 /* USER CODE END 4 */
 
 /**
