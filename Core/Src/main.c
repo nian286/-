@@ -60,6 +60,11 @@ typedef struct {
     volatile uint32_t overflow;            // 满时丢帧计数
 } ring_buf_t;
 ring_buf_t rb;
+
+// ---- 定时器14 + PWM 呼吸灯 ----
+TIM_HandleTypeDef htim14;            // 呼吸灯用 TIM14（挂在 APB1）
+static uint16_t breath_ccr = 0;     // 当前占空比(0~ARR)，越大 LED0 越亮(active-low+低极性)
+static int8_t   breath_dir = 1;     // 1=变亮, -1=变暗
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,6 +77,7 @@ static void ring_put(uint8_t c);
 static int  ring_get(uint8_t *c);
 static void drain_uart(void);
 static void process_command(uint8_t *cmd, uint16_t len);
+static void MX_TIM14_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -118,7 +124,23 @@ int main(void)
   if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1, dma_buf, DMA_BUF_SIZE) != HAL_OK) {
       Error_Handler();
   }
-  printf("UART DMA RX ready, send 'LED ON' / 'LED OFF'\r\n");
+  printf("UART DMA RX ready, send 'LED ON' / 'LED OFF' (controls LED1)\r\n");
+
+  // ---- 定时器14 + PWM 呼吸灯（LED0 = PF9 = TIM14_CH1） ----
+  MX_TIM14_Init();
+  // PF9 在 MX_GPIO_Init 里是 GPIO_Output，这里改配为 TIM14_CH1 复用(AF9)
+  GPIO_InitTypeDef pg = {0};
+  pg.Pin       = LED0_Pin;
+  pg.Mode      = GPIO_MODE_AF_PP;
+  pg.Pull      = GPIO_NOPULL;
+  pg.Speed     = GPIO_SPEED_FREQ_LOW;
+  pg.Alternate = GPIO_AF9_TIM14;
+  HAL_GPIO_Init(LED0_GPIO_Port, &pg);
+  // 启动 PWM 并打开更新中断：每 PWM 周期(1kHz)进一次回调做呼吸步进
+  if (HAL_TIM_PWM_Start_IT(&htim14, TIM_CHANNEL_1) != HAL_OK) {
+      Error_Handler();
+  }
+  printf("PWM breath on LED0 ready\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -127,13 +149,12 @@ int main(void)
   {
     /* USER CODE END WHILE */
 
-    drain_uart();   // 消费环形缓冲，解析串口命令（消费者）
+    drain_uart();   // 消费环形缓冲，解析串口命令（消费者，控制 LED1）
 
-    // 1s 心跳：LED1 翻转 + 打 tick，证明主循环在跑
+    // 1s 心跳：只打 tick 证明主循环在跑（LED1 改由串口命令控制）
     static uint32_t last_tick = 0;
     if (HAL_GetTick() - last_tick >= 1000) {
         last_tick = HAL_GetTick();
-        HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
         printf("tick=%lu\r\n", last_tick);
     }
     HAL_Delay(10);
@@ -294,11 +315,11 @@ static void MX_DMA_Init(void) {
 // ---- 命令解析（消费者，main 上下文） ----
 static void process_command(uint8_t *cmd, uint16_t len) {
     if (len >= 6 && strncmp((char *)cmd, "LED ON", 6) == 0) {
-        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);  // 低电平亮
-        printf("LED0 ON\r\n");
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);  // 低电平亮(LED1)
+        printf("LED1 ON\r\n");
     } else if (len >= 7 && strncmp((char *)cmd, "LED OFF", 7) == 0) {
-        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);    // 高电平灭
-        printf("LED0 OFF\r\n");
+        HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);    // 高电平灭
+        printf("LED1 OFF\r\n");
     } else {
         printf("Unknown: %s\r\n", cmd);
     }
@@ -340,6 +361,39 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
     }
     // 重武装：继续等下一帧（NORMAL 模式需手动重开）
     HAL_UARTEx_ReceiveToIdle_DMA(&huart1, dma_buf, DMA_BUF_SIZE);
+}
+
+// ---- 定时器14 初始化：1kHz PWM 载波，CH1 输出到 PF9(LED0) ----
+static void MX_TIM14_Init(void) {
+    __HAL_RCC_TIM14_CLK_ENABLE();
+    htim14.Instance = TIM14;
+    htim14.Init.Prescaler = 83;                    // TIM14 在 APB1，定时器时钟=APB1(42M)×2=84MHz；84M/(83+1)=1MHz 计数
+    htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim14.Init.Period = 999;                      // 1MHz / 1000 = 1kHz 载波(远高于闪烁融合频率)
+    htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_PWM_Init(&htim14) != HAL_OK) Error_Handler();
+
+    TIM_OC_InitTypeDef sOC = {0};
+    sOC.OCMode = TIM_OCMODE_PWM1;
+    sOC.Pulse = 0;                                 // 初始占空比 0
+    sOC.OCPolarity = TIM_OCPOLARITY_LOW;           // LED 低电平亮 → 低极性: CCR 越大亮越久
+    sOC.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim14, &sOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+
+    // TIM14 与 TIM8_TRG_COM 共用中断向量
+    HAL_NVIC_SetPriority(TIM8_TRG_COM_TIM14_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(TIM8_TRG_COM_TIM14_IRQn);
+}
+
+// ---- PWM 更新中断：每周期步进一次占空比，做出三角波呼吸 ----
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM14) {
+        breath_ccr += breath_dir;
+        if (breath_ccr >= 999) { breath_ccr = 999; breath_dir = -1; }   // 到顶反转
+        else if (breath_ccr == 0) { breath_dir = 1; }                   // 到底反转
+        __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, breath_ccr);
+    }
 }
 /* USER CODE END 4 */
 

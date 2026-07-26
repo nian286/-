@@ -43,6 +43,7 @@ extern "C" {
 /* USER CODE BEGIN EC */
 extern UART_HandleTypeDef huart1;
 extern DMA_HandleTypeDef hdma_usart1_rx;
+extern TIM_HandleTypeDef htim14;
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/

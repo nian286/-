@@ -208,4 +208,9 @@ void USART1_IRQHandler(void) {
 void DMA2_Stream2_IRQHandler(void) {
     HAL_DMA_IRQHandler(&hdma_usart1_rx);
 }
+
+// TIM14 全局中断（与 TIM8_TRG_COM 共用向量）：更新中断→呼吸步进
+void TIM8_TRG_COM_TIM14_IRQHandler(void) {
+    HAL_TIM_IRQHandler(&htim14);
+}
 /* USER CODE END 1 */
