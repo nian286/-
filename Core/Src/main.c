@@ -136,10 +136,14 @@ int main(void)
   pg.Speed     = GPIO_SPEED_FREQ_LOW;
   pg.Alternate = GPIO_AF9_TIM14;
   HAL_GPIO_Init(LED0_GPIO_Port, &pg);
-  // 启动 PWM 并打开更新中断：每 PWM 周期(1kHz)进一次回调做呼吸步进
-  if (HAL_TIM_PWM_Start_IT(&htim14, TIM_CHANNEL_1) != HAL_OK) {
+  // 启动 PWM 硬件输出：使能 OC 比较通道，PF9 引脚开始输出波形
+  if (HAL_TIM_PWM_Start(&htim14, TIM_CHANNEL_1) != HAL_OK) {
       Error_Handler();
   }
+  // 关键修复：HAL_TIM_PWM_Start_IT 只开“捕获比较(CC)中断”，并不会开“更新(Update)中断”。
+  // 呼吸步进依赖 HAL_TIM_PeriodElapsedCallback（更新中断触发），必须手动把更新中断打开，
+  // 否则 breath_ccr 永远卡在 0 → CCR=0 → 引脚整周期输出高电平 → LED0 一直灭。
+  __HAL_TIM_ENABLE_IT(&htim14, TIM_IT_UPDATE);
   printf("PWM breath on LED0 ready\r\n");
   /* USER CODE END 2 */
 
