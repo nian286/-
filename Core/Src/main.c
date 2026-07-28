@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include "oled.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -152,6 +153,38 @@ int main(void)
   // 否则 breath_ccr 永远卡在 0 → CCR=0 → 引脚整周期输出高电平 → LED0 一直灭。
   __HAL_TIM_ENABLE_IT(&htim14, TIM_IT_UPDATE);
   printf("PWM breath on LED0 ready\r\n");
+
+  // ---- I2C + OLED 显示（PB6=SCL, PB7=SDA，已加外部 4.7K 上拉） ----
+  OLED_I2C_Init();
+  OLED_Init();
+  // 演示：清屏 -> 画边框 + 两条对角线 + 中心实心圆 + 文字
+  OLED_Clear();
+  for (int x = 0; x < OLED_W; x++) {
+      OLED_DrawPixel(x, 0, 1);
+      OLED_DrawPixel(x, OLED_H - 1, 1);
+  }
+  for (int y = 0; y < OLED_H; y++) {
+      OLED_DrawPixel(0, y, 1);
+      OLED_DrawPixel(OLED_W - 1, y, 1);
+  }
+  OLED_DrawLine(0, 0, OLED_W - 1, OLED_H - 1, 1);
+  OLED_DrawLine(0, OLED_H - 1, OLED_W - 1, 0, 1);
+  int cx = OLED_W / 2, cy = OLED_H / 2, r = 18;
+  for (int y = -r; y <= r; y++)
+      for (int x = -r; x <= r; x++)
+          if (x * x + y * y <= r * r) OLED_DrawPixel(cx + x, cy + y, 1);
+
+  /* ---- 文字显示（6x8 ASCII 字模） ----
+   * 字模按页排版(8 行高),所以 y 必须是 8 的倍数,这里:
+   *   y=0   → 顶部"标题"行
+   *   y=24  → 第 4 页,在圆上方打个 HELLO
+   *   y=56  → 最底页,在边框内打 MCU 状态
+   */
+  OLED_DrawString(34, 0,  "I2C OLED");        /* 居中标题 */
+  OLED_DrawString(28, 24, "HELLO STM32");     /* 在圆上方 */
+  OLED_DrawString(8,  56, "F407 + SSD1306");  /* 最底一行 */
+  OLED_Refresh();
+  printf("OLED demo drawn (with text)\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
