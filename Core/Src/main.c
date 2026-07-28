@@ -117,9 +117,16 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  // 启动指示：能执行到这里 = HAL_Init + 系统时钟 + GPIO 初始化都成功（板子活着）
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);  // LED1 亮，证明程序已进 main
+
+  // 初始化 DMA 句柄 + 开时钟 + NVIC。
+  // ⚠️ 注意：此调用必须放在 USER CODE 块内——CubeMX 的 Generate Code 会重写 main()，
+  //    把标准初始化序列之外的手写 MX_* 调用删掉（上一版就是被它删了导致 DMA 句柄未初始化 → HardFault 全灭）。
+  MX_DMA_Init();
+
   // 启动 DMA + IDLE：硬件后台搬字节，仅一帧结束(IDLE)进一次回调，CPU 几乎零打扰
   if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1, dma_buf, DMA_BUF_SIZE) != HAL_OK) {
       Error_Handler();
@@ -153,16 +160,16 @@ int main(void)
   {
     /* USER CODE END WHILE */
 
-    drain_uart();   // 消费环形缓冲，解析串口命令（消费者，控制 LED1）
+    /* USER CODE BEGIN 3 */
+    drain_uart();   // 消费环形缓冲，解析串口命令（LED1 由 “LED ON/OFF” 控制）
 
-    // 1s 心跳：只打 tick 证明主循环在跑（LED1 改由串口命令控制）
+    // 心跳：仅打印 tick 证明主循环在跑（不翻灯，避免与按键/命令抢 LED1）
     static uint32_t last_tick = 0;
     if (HAL_GetTick() - last_tick >= 1000) {
         last_tick = HAL_GetTick();
         printf("tick=%lu\r\n", last_tick);
     }
     HAL_Delay(10);
-    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -274,6 +281,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : KEY_UP_Pin */
+  GPIO_InitStruct.Pin = KEY_UP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;  // WK_UP(PA0) 正点原子标准:按键另一端接VCC,按下=高电平;内部下拉使平时为低,按下产生上升沿触发
+  HAL_GPIO_Init(KEY_UP_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -399,6 +416,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
         __HAL_TIM_SET_COMPARE(&htim14, TIM_CHANNEL_1, breath_ccr);
     }
 }
+
+// ---- 按键外部中断回调：KEY_UP(PA0) 触发，软件消抖后翻转 LED1 ----
+// 配置：PULLDOWN + IT_RISING，适配 WK_UP(PA0) 按键另一端接 VCC（按下=上升沿）。
+// 若实机发现仍是“松手才翻”或“完全没反应”，说明键是“按下接地”接法，需改 PULLUP + IT_FALLING。
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin != KEY_UP_Pin) return;
+    static uint32_t last_k = 0;
+    uint32_t now = HAL_GetTick();
+    if (now - last_k < 30) return;            // 30ms 内重复触发忽略 = 软件消抖
+    last_k = now;
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    printf("KEY pressed -> LED1 toggled\r\n");
+}
 /* USER CODE END 4 */
 
 /**
@@ -415,7 +445,6 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
