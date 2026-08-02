@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <string.h>
 #include "oled.h"
+#include "spi.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -185,6 +186,14 @@ int main(void)
   OLED_DrawString(8,  56, "F407 + SSD1306");  /* 最底一行 */
   OLED_Refresh();
   printf("OLED demo drawn (with text)\r\n");
+
+  // ---- SPI1 寄存器级回环自测（PA5=SCK, PA7=MOSI, PA6=MISO, PA4=CS；Mode0, ~1.3MHz） ----
+  // 接线：用杜邦线把 PA7(MOSI) 与 PA6(MISO) 短接，即可自己发自己收
+  SPI1_Init();
+  int spi_ok = SPI1_LoopbackTest();
+  OLED_DrawString(8, 48, spi_ok ? "SPI1: PASS" : "SPI1: FAIL");  /* 页6，独立于原图形 */
+  OLED_Refresh();
+  printf("SPI1 loopback %s\r\n", spi_ok ? "PASSED" : "FAILED");
   /* USER CODE END 2 */
 
   /* Infinite loop */
