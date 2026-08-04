@@ -27,6 +27,7 @@
 #include <string.h>
 #include "oled.h"
 #include "spi.h"
+#include "adc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -67,6 +68,8 @@ ring_buf_t rb;
 TIM_HandleTypeDef htim14;            // 呼吸灯用 TIM14（挂在 APB1）
 static uint16_t breath_ccr = 0;     // 当前占空比(0~ARR)，越大 LED0 越亮(active-low+低极性)
 static int8_t   breath_dir = 1;     // 1=变亮, -1=变暗
+
+static volatile int wdt_hang = 0;    // 非 0 时停止喂狗，用于演示看门狗复位保护
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -194,6 +197,18 @@ int main(void)
   OLED_DrawString(8, 48, spi_ok ? "SPI1: PASS" : "SPI1: FAIL");  /* 页6，独立于原图形 */
   OLED_Refresh();
   printf("SPI1 loopback %s\r\n", spi_ok ? "PASSED" : "FAILED");
+
+  // ---- ADC1 寄存器级：读内部温度传感器（零硬件，无需电位器） ----
+  ADC1_Init();
+  uint16_t adc_raw = ADC1_ReadTempSensor();
+  float    adc_temp = ADC1_ToTempC(adc_raw);
+  printf("ADC temp sensor: raw=%u  T=%.1fC\r\n", adc_raw, adc_temp);
+
+  // ---- 看门狗：IWDG(独立,~1s) + WWDG(窗口,~50ms) ----
+  // 注意：必须在 OLED 刷新之后使能，避免刷新期间 I2C 长阻塞触发 WWDG 复位。
+  IWDG_Init();
+  WWDG_Init();
+  printf("IWDG(~4s) + WWDG(~100ms) armed (send 'HANG' to stop feeding -> auto reset)\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -205,11 +220,22 @@ int main(void)
     /* USER CODE BEGIN 3 */
     drain_uart();   // 消费环形缓冲，解析串口命令（LED1 由 “LED ON/OFF” 控制）
 
-    // 心跳：仅打印 tick 证明主循环在跑（不翻灯，避免与按键/命令抢 LED1）
+    // 心跳：每 1s 打印 tick + 芯片温度，证明主循环在跑
     static uint32_t last_tick = 0;
     if (HAL_GetTick() - last_tick >= 1000) {
         last_tick = HAL_GetTick();
-        printf("tick=%lu\r\n", last_tick);
+        uint16_t raw = ADC1_ReadTempSensor();
+        float temp = ADC1_ToTempC(raw);
+        printf("tick=%lu  TEMP=%.1fC (raw=%u)\r\n", last_tick, temp, raw);
+    }
+    // 喂狗：IWDG 每循环都喂(~10ms << 1s 超时)；WWDG 每 ~40ms 喂一次(落在窗口内)
+    if (!wdt_hang) {
+        IWDG_Feed();
+        static uint32_t last_wdog = 0;
+        if (HAL_GetTick() - last_wdog >= 40) {
+            last_wdog = HAL_GetTick();
+            WWDG_Feed();
+        }
     }
     HAL_Delay(10);
   }
@@ -383,6 +409,9 @@ static void process_command(uint8_t *cmd, uint16_t len) {
     } else if (len >= 7 && strncmp((char *)cmd, "LED OFF", 7) == 0) {
         HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);    // 高电平灭
         printf("LED1 OFF\r\n");
+    } else if (len >= 4 && strncmp((char *)cmd, "HANG", 4) == 0) {
+        wdt_hang = 1;
+        printf("HANG: 停止喂狗，看门狗将在 ~1s 后自动复位系统\r\n");
     } else {
         printf("Unknown: %s\r\n", cmd);
     }
@@ -409,6 +438,8 @@ static void drain_uart(void) {
             process_command(line, 7); li = 0;
         } else if (li >= 6 && strncmp((char *)line, "LED ON", 6) == 0) {
             process_command(line, 6); li = 0;
+        } else if (li >= 4 && strncmp((char *)line, "HANG", 4) == 0) {
+            process_command(line, 4); li = 0;
         }
     }
 }
